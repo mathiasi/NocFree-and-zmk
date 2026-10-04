@@ -57,6 +57,31 @@ properties:
       time for the configured bus speed or the scanner cannot hold its
       schedule. See docs/architecture.md for the budget.
 
+  int-gpios:
+    type: phandle-array
+    description: |
+      The PCA9555 INT line, if it is wired to the controller. Active low and
+      open-drain, so declare it GPIO_ACTIVE_LOW and pull it up.
+
+      The pin differs per half and the two are not interchangeable: the left
+      half uses P0.31, the right P0.05, and each half uses the OTHER half's
+      INT pin for its battery-divider enable. This belongs in the board .dts,
+      never in the shared .dtsi.
+
+      When present the scanner stops polling once every key has settled and
+      waits on this line instead. Omit it and the scanner polls exactly as it
+      did before.
+
+  fallback-poll-period-ms:
+    type: int
+    default: 1000
+    description: |
+      How often to scan anyway while parked on the interrupt. This is a safety
+      net, not a power/latency trade: if the interrupt never arrives -- wrong
+      pin, unpopulated trace, a part that does not assert INT -- the keyboard
+      degrades to one scan per second instead of going dead. Only meaningful
+      alongside int-gpios.
+
   poll-period-ms:
     type: int
     default: 10

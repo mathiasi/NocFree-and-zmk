@@ -28,6 +28,13 @@
 
         expanders = <&pca20>, <&pca22>, <&pca24>;
 
+        /*
+         * PCA9555 INT, D1 on this half. Active low, pulled up. The right half
+         * uses P0.31 as its battery-divider enable, so this line must never
+         * move into nocfree_and.dtsi.
+         */
+        int-gpios = <&gpio0 31 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+
         poll-period-ms = <10>;
         debounce-scan-period-ms = <3>;
         debounce-press-ms = <5>;

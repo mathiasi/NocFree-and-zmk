@@ -8,6 +8,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/kscan.h>
 #include <zephyr/init.h>
@@ -58,6 +59,10 @@ struct kscan_pca9555_config {
     struct zmk_debounce_config debounce;
     uint16_t debounce_scan_period_ms;
     uint16_t poll_period_ms;
+    /* The PCA9555 INT line. .port is NULL when the board declares none, and
+     * everything below then behaves exactly as it did before. */
+    struct gpio_dt_spec int_gpio;
+    uint16_t fallback_poll_period_ms;
 };
 
 struct kscan_pca9555_data {
@@ -80,6 +85,12 @@ struct kscan_pca9555_data {
     bool enabled;
     /** Set once every expander has been configured and read back correctly. */
     bool ready;
+    /** Interrupt plumbing; untouched when the board declares no int-gpios. */
+    struct gpio_callback int_cb;
+    /** True while the scanner is parked on the interrupt instead of polling. */
+    bool int_armed;
+    /** Consecutive scans queued because INT was asserted at arming time. */
+    uint8_t immediate_streak;
 };
 
 /* Write a 16-bit value to a PCA9555 register pair. */
@@ -154,6 +165,96 @@ static int kscan_pca9555_configure_expander(const struct i2c_dt_spec *i2c) {
     return 0;
 }
 
+static bool kscan_pca9555_has_int(const struct kscan_pca9555_config *config) {
+    return config->int_gpio.port != NULL;
+}
+
+static void kscan_pca9555_int_disarm(const struct device *dev) {
+    const struct kscan_pca9555_config *config = dev->config;
+    struct kscan_pca9555_data *data = dev->data;
+
+    if (!kscan_pca9555_has_int(config) || !data->int_armed) {
+        return;
+    }
+
+    (void)gpio_pin_interrupt_configure_dt(&config->int_gpio, GPIO_INT_DISABLE);
+    data->int_armed = false;
+}
+
+static void kscan_pca9555_int_handler(const struct device *port, struct gpio_callback *cb,
+                                      uint32_t pins) {
+    struct kscan_pca9555_data *data = CONTAINER_OF(cb, struct kscan_pca9555_data, int_cb);
+
+
+    /*
+     * Disarmed here rather than merely acknowledged. The line is
+     * level-triggered and stays asserted until a scan reads the expanders'
+     * input registers, so an interrupt left enabled would re-enter
+     * immediately and starve every other thread.
+     */
+    kscan_pca9555_int_disarm(data->dev);
+
+    /*
+     * Reset the deadline before queueing. It belongs to the timer this is
+     * pre-empting, and kscan_pca9555_reschedule() accumulates onto it: left
+     * in the future, the debounce rescan that follows this scan is computed
+     * as deadline + 3 ms rather than now + 3 ms, so it lands most of a
+     * fallback period away and presses never resolve. That reads as a dead
+     * keyboard, not a slow one.
+     */
+    data->scan_deadline = k_uptime_get();
+    k_work_reschedule_for_queue(&kscan_pca9555_work_q, &data->work, K_NO_WAIT);
+}
+
+/*
+ * Park on the interrupt.
+ *
+ * Edge-triggered, on the falling edge, which is what the factory firmware
+ * does -- attachInterrupt(D1, handler, FALLING) in v2.4.5.
+ *
+ * A level interrupt was tried first and stormed -- 2,299,361 handler entries
+ * across 11 arms. That measurement is not trustworthy: it was taken with a
+ * diagnostic module compiled in that reconfigured this pin without
+ * GPIO_ACTIVE_LOW, clearing the invert bit, so the interrupt was armed
+ * against the wrong sense. Whether level would work once the inversion is
+ * right has not been retested. Edge is used because it matches the factory
+ * firmware and is measured working, not because level is known to be bad.
+ *
+ * Edge alone would lose a key that changes between the read above and this
+ * call -- the edge happens before the interrupt is listening. So after
+ * arming, the line is sampled once: if INT is already asserted, that edge is
+ * gone and a scan is queued immediately instead of waiting for one that will
+ * never come.
+ */
+static int kscan_pca9555_arm(const struct device *dev) {
+    const struct kscan_pca9555_config *config = dev->config;
+    struct kscan_pca9555_data *data = dev->data;
+
+    if (!kscan_pca9555_has_int(config)) {
+        return -ENOTSUP;
+    }
+
+    int err = gpio_pin_interrupt_configure_dt(&config->int_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+    if (err) {
+        LOG_ERR("Cannot arm INT: %d; continuing to poll", err);
+        return err;
+    }
+
+    data->int_armed = true;
+
+    /*
+     * Close the window between the read and the arm. gpio_pin_get_dt() is
+     * logical, so 1 means asserted for this active-low line.
+     */
+    if (gpio_pin_get_dt(&config->int_gpio) == 1) {
+        kscan_pca9555_int_disarm(dev);
+        /* Report it; the caller owns scheduling and the deadline. */
+        return 1;
+    }
+
+    return 0;
+}
+
 static void kscan_pca9555_reschedule(const struct device *dev, uint16_t delay_ms) {
     struct kscan_pca9555_data *data = dev->data;
     const int64_t now = k_uptime_get();
@@ -182,6 +283,9 @@ static int kscan_pca9555_read(const struct device *dev) {
     if (!data->enabled) {
         return 0;
     }
+
+    /* Whatever brought us here, the interrupt has served its purpose. */
+    kscan_pca9555_int_disarm(dev);
 
     for (uint8_t i = 0; i < config->expander_count; i++) {
         int err = kscan_pca9555_read_pair(&config->expanders[i],
@@ -245,8 +349,43 @@ static int kscan_pca9555_read(const struct device *dev) {
         continue_scan = continue_scan || zmk_debounce_is_active(state);
     }
 
-    kscan_pca9555_reschedule(dev, continue_scan ? config->debounce_scan_period_ms
-                                                : config->poll_period_ms);
+    if (continue_scan) {
+        /* Keys are still settling and the debouncer needs real scans. */
+        kscan_pca9555_reschedule(dev, config->debounce_scan_period_ms);
+    } else {
+        const int armed = kscan_pca9555_arm(dev);
+
+        if (armed == 1 && data->immediate_streak < 8) {
+            /*
+             * INT asserted between the read above and the arm, so its edge is
+             * already gone. Scan again at once, from a deadline of now.
+             */
+            data->immediate_streak++;
+            data->scan_deadline = k_uptime_get();
+            kscan_pca9555_reschedule(dev, 0);
+        } else if (armed == 1) {
+            /*
+             * Eight in a row means the line is asserted and the read is not
+             * clearing it. Something is wrong that this driver cannot fix by
+             * scanning harder, so stop spinning and go back to plain polling.
+             */
+            kscan_pca9555_int_disarm(dev);
+            kscan_pca9555_reschedule(dev, config->poll_period_ms);
+        } else if (armed == 0) {
+            /*
+             * Parked on the interrupt -- but still scheduled. The fallback
+             * scan is a safety net rather than a power/latency trade: if the
+             * line never asserts, because the pin is wrong or the trace
+             * unpopulated or the part does not drive INT, this degrades to
+             * one scan a second instead of a keyboard that stops responding.
+             */
+            data->immediate_streak = 0;
+            kscan_pca9555_reschedule(dev, config->fallback_poll_period_ms);
+        } else {
+            data->immediate_streak = 0;
+            kscan_pca9555_reschedule(dev, config->poll_period_ms);
+        }
+    }
     return 0;
 }
 
@@ -309,6 +448,7 @@ static int kscan_pca9555_disable_callback(const struct device *dev) {
      * That successor observes the cleared flag and stops without rescheduling.
      */
     data->enabled = false;
+    kscan_pca9555_int_disarm(dev);
     k_work_cancel_delayable(&data->work);
     return 0;
 }
@@ -349,6 +489,27 @@ static int kscan_pca9555_init(const struct device *dev) {
         }
 
         data->key_expander[column] = index;
+    }
+
+    if (kscan_pca9555_has_int(config)) {
+        if (!gpio_is_ready_dt(&config->int_gpio)) {
+            LOG_ERR("INT gpio is not ready");
+            return -ENODEV;
+        }
+
+        int err = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_ERR("Cannot configure INT gpio: %d", err);
+            return err;
+        }
+
+        gpio_init_callback(&data->int_cb, kscan_pca9555_int_handler, BIT(config->int_gpio.pin));
+
+        err = gpio_add_callback(config->int_gpio.port, &data->int_cb);
+        if (err) {
+            LOG_ERR("Cannot add INT callback: %d", err);
+            return err;
+        }
     }
 
     data->ready = true;
@@ -420,6 +581,8 @@ static const struct kscan_driver_api kscan_pca9555_api = {
             },                                                                                     \
         .debounce_scan_period_ms = DT_INST_PROP(n, debounce_scan_period_ms),                       \
         .poll_period_ms = DT_INST_PROP(n, poll_period_ms),                                         \
+        .int_gpio = GPIO_DT_SPEC_INST_GET_OR(n, int_gpios, {0}),                                    \
+        .fallback_poll_period_ms = DT_INST_PROP(n, fallback_poll_period_ms),                        \
     };                                                                                             \
                                                                                                    \
     DEVICE_DT_INST_DEFINE(n, &kscan_pca9555_init, NULL, &kscan_pca9555_data_##n,                   \

@@ -27,6 +27,12 @@
 
         expanders = <&pca20>, <&pca22>, <&pca24>;
 
+        /*
+         * PCA9555 INT, D0 on this half. The left half uses P0.05 as its
+         * battery-divider enable; the pins are not interchangeable.
+         */
+        int-gpios = <&gpio0 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+
         poll-period-ms = <10>;
         debounce-scan-period-ms = <3>;
         debounce-press-ms = <5>;
